@@ -1,0 +1,20 @@
+{
+  "name": "openclaw-1password",
+  "version": "1.0.0",
+  "description": "Secure OpenClaw with 1Password service accounts using SecretRef exec providers. Includes setup automation, environment diagnosis, and repair tools.",
+  "author": {
+    "name": "Drew Burchfield",
+    "url": "https://github.com/drewburchfield"
+  },
+  "homepage": "https://github.com/drewburchfield/openclaw-1password",
+  "repository": "https://github.com/drewburchfield/openclaw-1password",
+  "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "1password",
+    "secretref",
+    "secrets",
+    "security",
+    "service-account"
+  ]
+}
