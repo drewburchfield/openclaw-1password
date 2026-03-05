@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-1password-dev",
+  "owner": {"name": "Drew Burchfield", "url": "https://github.com/drewburchfield"},
+  "plugins": [{
+    "name": "openclaw-1password",
+    "source": "./",
+    "description": "Secure OpenClaw with 1Password service accounts using SecretRef exec providers. Includes setup automation, environment diagnosis, and repair tools.",
+    "version": "1.0.0",
+    "author": {"name": "Drew Burchfield", "url": "https://github.com/drewburchfield"},
+    "category": "security",
+    "homepage": "https://github.com/drewburchfield/openclaw-1password"
+  }]
+}
