@@ -7,10 +7,10 @@ This plugin was authored against OpenClaw 2026.3.2 and 1Password CLI 2.18+. Both
 These principles hold regardless of OpenClaw version:
 
 1. **Zero plaintext secrets in config files.** The config file should contain references (SecretRef objects or `${VAR}` strings), never actual credential values.
-2. **File-backed service account token.** Store `OP_SERVICE_ACCOUNT_TOKEN` in `~/.openclaw/.op-token` (chmod 600) rather than environment variables that get clobbered by OpenClaw config management.
+2. **Env var file for 1Password auth.** Store `OP_SERVICE_ACCOUNT_TOKEN` and TCC-prevention vars in `~/.openclaw/.env` (chmod 600) rather than environment variables that get clobbered by OpenClaw config management.
 3. **Exec provider as the extension point.** OpenClaw's exec provider pattern is the official, long-term model for external secret managers. No first-party 1Password integration is planned.
-4. **Resolver script as the bridge.** A script that speaks the jsonOnly protocol (JSON on stdin/stdout) bridges OpenClaw's SecretRef system to `op read`. The protocol may evolve but the concept is stable.
-5. **Launcher script for exceptions.** Any credential field that doesn't support SecretRef needs env var resolution before the gateway process starts. The launcher script handles this.
+4. **Direct op calls.** Each provider calls `op read` directly with `jsonOnly: false`. No custom resolver script needed.
+5. **TCC prevention in headless contexts.** Four env vars (`OP_SERVICE_ACCOUNT_TOKEN`, `OP_BIOMETRIC_UNLOCK_ENABLED=false`, `OP_NO_AUTO_SIGNIN=true`, `OP_LOAD_DESKTOP_APP_SETTINGS=false`) must be set wherever `op` runs without a terminal.
 6. **Repair after updates.** OpenClaw updates can regenerate service configuration (LaunchAgent plists, systemd units). Always verify and repair after updates.
 
 ## Version Discovery Checklist
@@ -46,38 +46,39 @@ op service-account --help 2>/dev/null
 
 | Area | What to check | Impact |
 |------|--------------|--------|
-| SecretRef credential surface | New fields added, or restrictions removed | More fields may accept SecretRef; `gateway.auth.token` may gain support |
+| SecretRef credential surface | New fields added, or restrictions removed | More fields may accept SecretRef; `gateway.auth.token` may gain support (#29183) |
 | Config schema | New top-level keys, renamed fields | Setup script's jq queries may need updating |
 | CLI commands | New subcommands for secrets management | May replace manual jq-based config editing |
-| Exec provider protocol | Protocol version bump, new fields in request/response | Resolver script may need protocol updates |
-| Gateway launcher | Changes to entry point path or arguments | `launch-gateway.sh` exec line may need updating |
+| Exec provider protocol | New provider fields, changed validation | Provider entries may need new or renamed fields |
+| Gateway launcher | Changes to entry point path or arguments | Plist ProgramArguments may need updating |
 | Service management | New LaunchAgent/systemd handling | Repair logic may need updating |
 | Built-in providers | First-party secret manager support | May eventually replace the exec provider bridge |
+| .env file handling | Changes to how the gateway reads .env | May affect env var injection approach |
 
 ### 1Password CLI Changes to Watch For
 
 | Area | What to check | Impact |
 |------|--------------|--------|
-| `op read` syntax | Flag changes, output format | Resolver script may need updating |
+| `op read` syntax | Flag changes, output format | Provider `args` arrays may need updating |
 | Service accounts | Authentication flow changes | Token file format or creation process may change |
-| Biometric unlock | Default behavior changes | `OP_BIOMETRIC_UNLOCK_ENABLED` handling may change |
-| Connect server | 1Password Connect as alternative to CLI | May offer a socket-based resolver instead of CLI calls |
+| TCC behavior | New env vars or changed defaults | The 4 TCC vars may need additions or removals |
+| Connect server | 1Password Connect as alternative to CLI | May offer a socket-based approach instead of CLI calls |
 
 ## Adaptation Strategies
 
 ### If the user's OpenClaw is newer than 2026.3.2
 
 1. **Check the changelog.** Look for SecretRef or secrets-related changes.
-2. **Test the gateway.auth.token exception.** Try setting it to a SecretRef object. If it works, the launcher script can be simplified to just exec node directly (no env var resolution needed).
+2. **Test the gateway.auth.token exception.** Try setting it to a SecretRef object. If it works, the plist no longer needs `OPENCLAW_GATEWAY_TOKEN` and the `${VAR}` reference can be removed.
 3. **Check for a built-in secrets CLI.** Newer versions may have `openclaw secrets migrate` or similar commands that automate what the setup script does.
-4. **Verify the exec provider schema.** Run `openclaw help secretref` or check if `secrets.providers` in the config still uses the same field names.
+4. **Verify the exec provider schema.** Run `openclaw help secretref` or check if `secrets.providers` in the config still uses the same field names (`command`, `args`, `allowSymlinkCommand`, `trustedDirs`, `passEnv`, `jsonOnly`).
 5. **Test the verify script.** Run `scripts/openclaw-1p-setup.sh verify` and check for false positives/negatives caused by version differences.
 
 ### If the user's OpenClaw is older than 2026.3.2
 
 1. **Check SecretRef support.** Versions before 2026.3.2 had limited SecretRef credential surface (fewer than 64 fields). Some secrets may need to remain as `${VAR}` references.
 2. **Consider upgrading first.** `npm install -g openclaw@latest` is usually safe and gets full SecretRef support.
-3. **Fall back to `${VAR}` + `op run`.** For fields that don't support SecretRef on older versions, use the legacy pattern documented in `references/tutorial.md`.
+3. **Fall back to `${VAR}` + `op run`.** For fields that don't support SecretRef on older versions, use the legacy pattern.
 
 ### If the setup script fails
 
@@ -91,22 +92,17 @@ op service-account --help 2>/dev/null
 After making any version-specific changes:
 
 ```bash
-# 1. Test resolver in isolation
-echo '{"protocolVersion":1,"provider":"onepassword","ids":["op://VAULT/ITEM/FIELD"]}' \
-  | ~/.openclaw/bin/op-resolver.sh | jq '.'
+# 1. Test op read directly
+source ~/.openclaw/.env
+op read "op://VAULT/ITEM/FIELD"
 
-# 2. Test launcher in isolation (just the token resolution, not the exec)
-OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.openclaw/.op-token)" \
-  OP_BIOMETRIC_UNLOCK_ENABLED=false \
-  op read "op://VAULT/ITEM/FIELD"
-
-# 3. Validate config JSON
+# 2. Validate config JSON
 cat ~/.openclaw/openclaw.json | jq '.' > /dev/null && echo "Valid JSON"
 
-# 4. Start gateway and check
+# 3. Start gateway and check
 openclaw gateway status
 
-# 5. Full verification
+# 4. Full verification
 scripts/openclaw-1p-setup.sh verify
 ```
 
@@ -114,8 +110,8 @@ scripts/openclaw-1p-setup.sh verify
 
 Based on OpenClaw's roadmap (as of 2026.3.2):
 
-- **Exec provider is the long-term model.** No first-party vault integrations are planned. The exec bridge pattern is intentional and stable.
+- **Exec provider is the long-term model.** No first-party vault integrations are planned. The direct-op pattern is intentional and stable.
 - **SecretRef credential surface expanded to 64 targets in 2026.3.2.** This covers all common credential fields. Further expansion is likely.
-- **gateway.auth.token SecretRef support was not planned as of 2026.3.2.** The `${VAR}` + launcher workaround is the correct approach until this changes.
+- **gateway.auth.token SecretRef support is blocked by #29183.** The `${VAR}` + plist env var workaround is the correct approach until this is fixed.
 - **No post-install lifecycle hooks exist.** The repair command remains the best mitigation for service config clobbering after updates.
 - **Config rewrite safety has open bugs.** SecretRef objects survive by design, but `${VAR}` references remain vulnerable to plaintext bake-back.

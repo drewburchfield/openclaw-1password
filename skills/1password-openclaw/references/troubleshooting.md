@@ -26,14 +26,14 @@ grep -c '"\${' ~/.openclaw/openclaw.json
 # Count SecretRef objects
 grep -c '"source" : "exec"' ~/.openclaw/openclaw.json
 
-# Token file check
-ls -la ~/.openclaw/.op-token
+# .env file check
+ls -la ~/.openclaw/.env
 
 # Test token validity
-OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.openclaw/.op-token)" OP_BIOMETRIC_UNLOCK_ENABLED=false op vault list
+source ~/.openclaw/.env && op vault list
 
-# Test resolver
-echo '{"protocolVersion":1,"provider":"onepassword","ids":["op://YOUR_VAULT/YOUR_ITEM/credential"]}' | ~/.openclaw/bin/op-resolver.sh | jq '.'
+# Test op read directly
+source ~/.openclaw/.env && op read "op://YOUR_VAULT/YOUR_ITEM/credential"
 ```
 
 ## Common Failures
@@ -51,65 +51,106 @@ tail -20 ~/.openclaw/logs/gateway.err.log
 Error: `MissingEnvVarError: Missing env var "SOME_VAR"`
 The config has a `${VAR}` reference but the variable isn't in the environment.
 - If the field supports SecretRef: migrate it to a SecretRef object
-- If it's `gateway.auth.token`: ensure the launcher script resolves it
+- If it's `gateway.auth.token`: ensure `OPENCLAW_GATEWAY_TOKEN` is in the plist EnvironmentVariables
 
 **Cause 2: Invalid SecretRef field**
 Error: `Invalid input: expected string, received object`
 A field that doesn't support SecretRef has a SecretRef object. Revert to `${VAR}` or plaintext.
 
-**Cause 3: Resolver script failure**
+**Cause 3: Provider command failure**
 Error: timeout or connection errors in the log.
-Test the resolver manually:
+Test `op` directly:
 ```bash
-echo '{"protocolVersion":1,"provider":"onepassword","ids":["op://vault/item/field"]}' | ~/.openclaw/bin/op-resolver.sh
+source ~/.openclaw/.env
+op read "op://OpenClaw Secrets/openclaw-discord/credential"
 ```
 
 ### "op would like to access data from other apps" prompt
 
-**Symptom:** Persistent macOS TCC dialog about `op` accessing data.
+**Symptom:** Persistent macOS TCC dialog about `op` accessing data, especially after reboot or gateway restart.
 
-**Cause:** `OP_BIOMETRIC_UNLOCK_ENABLED` is not set to `false` in a headless context. When `true`, `op` tries to connect to the 1Password desktop app via IPC.
+**Cause:** One or more of the 4 TCC-prevention env vars is missing from the `op` execution context. The most common culprit is `OP_LOAD_DESKTOP_APP_SETTINGS` not being set to `false`, which causes `op` to `lstat` the Group Containers directory.
 
-**Fix:** Ensure `export OP_BIOMETRIC_UNLOCK_ENABLED=false` appears in:
-- `op-resolver.sh`
-- `launch-gateway.sh`
-- Any Mac app wrapper scripts
+**Fix:** Ensure all 4 vars are present in three places:
+
+1. **`~/.openclaw/.env`** (source of truth):
+```bash
+OP_SERVICE_ACCOUNT_TOKEN=ops_eyJ...
+OP_BIOMETRIC_UNLOCK_ENABLED=false
+OP_NO_AUTO_SIGNIN=true
+OP_LOAD_DESKTOP_APP_SETTINGS=false
+```
+
+2. **Plist EnvironmentVariables** (for LaunchAgent context):
+```bash
+# Check what's in the plist
+/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+```
+
+3. **Provider `passEnv` arrays** (in openclaw.json):
+Each provider needs `"passEnv": ["OP_SERVICE_ACCOUNT_TOKEN", "OP_BIOMETRIC_UNLOCK_ENABLED", "OP_NO_AUTO_SIGNIN", "OP_LOAD_DESKTOP_APP_SETTINGS"]`.
+
+Run repair to fix all three:
+```bash
+./openclaw-1p-setup.sh repair
+```
 
 ### After `openclaw gateway install`, gateway breaks
 
-**Symptom:** Gateway was working, then after an OpenClaw update or `openclaw gateway install`, it crashes.
+**Symptom:** Gateway was working, then after an OpenClaw update or `openclaw gateway install`, it crashes or triggers TCC prompts.
 
-**Cause:** The plist was regenerated with default ProgramArguments (direct node call, no launcher).
+**Cause:** The plist was regenerated. Typical damage:
+- Node path set to versioned Cellar path (e.g., `/opt/homebrew/Cellar/node/25.7.0/bin/node`)
+- ThrottleInterval reset to 1
+- 1Password env vars removed from EnvironmentVariables
+- OPENCLAW_GATEWAY_TOKEN removed from EnvironmentVariables
 
 **Fix:**
 ```bash
 ./openclaw-1p-setup.sh repair
 ```
 
-Or manually:
-```bash
-# Re-point ProgramArguments to launcher
-/usr/libexec/PlistBuddy -c "Delete :ProgramArguments" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-/usr/libexec/PlistBuddy -c "Add :ProgramArguments array" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-/usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $HOME/.openclaw/bin/launch-gateway.sh" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+This fixes the node path to the stable symlink, restores ThrottleInterval to 30, ensures all 1Password env vars are in the plist, resolves and sets OPENCLAW_GATEWAY_TOKEN, and bounces the gateway.
 
-# Bounce
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-sleep 2
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+### After Homebrew upgrade of `op`, gateway breaks
+
+**Symptom:** Gateway can't resolve secrets after upgrading 1Password CLI via Homebrew.
+
+**Cause:** Unlikely with the new architecture. The providers use `allowSymlinkCommand: true` with `trustedDirs: ["/opt/homebrew"]`, so the symlink `/opt/homebrew/bin/op` keeps working even when the Cellar target changes.
+
+**If it still breaks:** Check that the `op` binary actually exists:
+```bash
+ls -la /opt/homebrew/bin/op
 ```
+If Homebrew unlinked it, run `brew link 1password-cli`.
+
+### After Homebrew upgrade of `node`, gateway breaks
+
+**Symptom:** Gateway fails to start. Error log shows "No such file or directory" for a `/opt/homebrew/Cellar/node/X.Y.Z/bin/node` path.
+
+**Cause:** `openclaw gateway install` hardcoded the versioned Cellar path. When Homebrew upgrades node, that path no longer exists.
+
+**Fix:**
+```bash
+./openclaw-1p-setup.sh repair
+```
+
+This replaces Cellar paths with the stable symlink `/opt/homebrew/opt/node/bin/node`, which survives Homebrew upgrades.
 
 ### "No accounts configured" from op read
 
-**Symptom:** Resolver or launcher fails with "No accounts configured for use with 1Password CLI."
+**Symptom:** Provider calls fail with "No accounts configured for use with 1Password CLI."
 
-**Cause 1:** Token file is missing or empty.
+**Cause 1:** `OP_SERVICE_ACCOUNT_TOKEN` is not in the environment. Check:
 ```bash
-cat ~/.openclaw/.op-token | head -c 10
-# Should start with "ops_"
+/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:OP_SERVICE_ACCOUNT_TOKEN" ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 ```
 
-**Cause 2:** Token is expired or revoked. Create a new service account and update the token file.
+**Cause 2:** Token is expired or revoked. Test it:
+```bash
+source ~/.openclaw/.env && op vault list
+```
+If it fails, create a new service account and update `~/.openclaw/.env`.
 
 **Cause 3:** In a LaunchAgent context, `HOME` isn't set. Check:
 ```bash
@@ -122,10 +163,12 @@ cat ~/.openclaw/.op-token | head -c 10
 
 **Cause 1:** The audit CLI needs `OPENCLAW_GATEWAY_TOKEN` in its environment (for the one `${VAR}` field). Run with it:
 ```bash
-OPENCLAW_GATEWAY_TOKEN="$(OP_SERVICE_ACCOUNT_TOKEN=$(cat ~/.openclaw/.op-token) OP_BIOMETRIC_UNLOCK_ENABLED=false op read "op://vault/openclaw-gateway/credential")" openclaw secrets audit --check
+source ~/.openclaw/.env
+OPENCLAW_GATEWAY_TOKEN="$(op read "op://OpenClaw Secrets/openclaw-gateway/credential")" \
+  openclaw secrets audit --check
 ```
 
-**Cause 2:** A SecretRef provider failed to resolve. Test the resolver manually.
+**Cause 2:** A provider failed to resolve. Test `op read` directly with the specific `op://` reference from the failing provider.
 
 ### Mac app can't connect to gateway
 
@@ -133,22 +176,7 @@ OPENCLAW_GATEWAY_TOKEN="$(OP_SERVICE_ACCOUNT_TOKEN=$(cat ~/.openclaw/.op-token) 
 
 **Cause:** The Mac app may need env vars that aren't in the GUI process environment.
 
-**Fix:** Use the wrapper app ("OpenClaw (Safe)") that runs the Mac app binary under `op read` context. Or verify the gateway is running and the Mac app can reach localhost:18789.
-
-### Node path changed after Homebrew upgrade
-
-**Symptom:** Gateway fails to start. Error log shows "MODULE_NOT_FOUND" or the node binary path doesn't exist.
-
-**Fix:** Update `launch-gateway.sh` with the new node path:
-```bash
-which node  # Get the new path
-# Edit ~/.openclaw/bin/launch-gateway.sh
-```
-
-Or use a dynamic path in the launcher:
-```bash
-exec "$(brew --prefix node)/bin/node" ...
-```
+**Fix:** Verify the gateway is running and the Mac app can reach localhost:18789. If the Mac app works through the gateway (which it should), just fixing the gateway is enough.
 
 ### SecretRef provider not found in config after update
 
@@ -161,7 +189,7 @@ exec "$(brew --prefix node)/bin/node" ...
 ./openclaw-1p-setup.sh repair
 ```
 
-This re-adds the provider block if missing.
+This re-adds the provider entries if missing.
 
 ### Config shows plaintext after openclaw doctor
 
@@ -174,14 +202,28 @@ This re-adds the provider block if missing.
 2. Re-run setup or manually restore the SecretRef objects
 3. Run `openclaw secrets audit --check` to verify
 
-### Permission denied on .op-token
+### Permission denied on .env file
 
-**Symptom:** Resolver fails because it can't read the token file.
+**Symptom:** Gateway can't read 1Password env vars.
 
 **Fix:**
 ```bash
-chmod 600 ~/.openclaw/.op-token
-chown $(whoami) ~/.openclaw/.op-token
+chmod 600 ~/.openclaw/.env
+chown $(whoami) ~/.openclaw/.env
 ```
 
 If running as a different user (e.g., systemd service), ensure the service user owns the file.
+
+### Provider timeout errors
+
+**Symptom:** Gateway logs show timeout errors when resolving secrets.
+
+**Cause:** `op read` is slow or hanging. Common reasons: network issues reaching 1Password servers, or `op` is trying interactive auth instead of using the service account.
+
+**Fix:**
+1. Test `op read` manually to see how long it takes:
+```bash
+time source ~/.openclaw/.env && op read "op://OpenClaw Secrets/openclaw-discord/credential"
+```
+2. If it hangs, check that `OP_SERVICE_ACCOUNT_TOKEN` is set (not empty)
+3. Increase `timeoutMs` in the provider config if `op` is just slow (e.g., on a flaky network)

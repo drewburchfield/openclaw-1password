@@ -4,18 +4,17 @@
 
 Right now, your OpenClaw secrets are probably sitting in `~/.openclaw/openclaw.json` as plaintext. Every API key, every bot token, every credential. Readable by any process on your machine. Visible in backups. Exposed if you ever share your config.
 
-This guide fixes that. You'll move every secret into 1Password and have them resolved at runtime using OpenClaw's SecretRef exec provider system. Nothing sensitive ever touches disk. The config file contains structured references, the gateway resolves them on demand, and you get audit trails, rotation, and revocation for free.
+This guide fixes that. You'll move every secret into 1Password and have them resolved at runtime by calling `op` directly through OpenClaw's SecretRef exec provider system. Nothing sensitive ever touches disk. The config file contains structured references, the gateway resolves them on demand, and you get audit trails, rotation, and revocation for free.
 
 **What you'll end up with:**
 
 | Before | After |
 |--------|-------|
-| `"token": "xoxb-1234-real-token"` | `"token": { "source": "exec", "provider": "onepassword", "id": "op://..." }` |
+| `"token": "xoxb-1234-real-token"` | `"token": { "source": "exec", "provider": "discord-token", "id": "discord-token" }` |
 | Secrets in plaintext JSON on disk | Secrets in 1Password, resolved at runtime |
 | `openclaw update` can bake secrets into JSON | SecretRef objects survive config rewrites by design |
-| LaunchAgent breaks after every update | LaunchAgent needs no special wrapping |
+| LaunchAgent breaks after every update | One repair command fixes it |
 | No audit trail | Full access logs in 1Password |
-| Revoking a key means editing files | Revoking a key means clicking a button |
 
 **Time to complete:** 20-30 minutes (or 5 minutes with the setup script).
 
@@ -30,10 +29,12 @@ OpenClaw has a native SecretRef system that calls external programs to resolve s
 The flow:
 
 1. Gateway starts and reads `openclaw.json`
-2. It encounters a SecretRef object: `{ "source": "exec", "provider": "onepassword", "id": "op://vault/item/field" }`
-3. It calls your resolver script, passing the `op://` reference
-4. The resolver script calls `op read` to fetch the actual value from 1Password
+2. It encounters a SecretRef object: `{ "source": "exec", "provider": "discord-token", "id": "discord-token" }`
+3. It calls `op read "op://vault/item/field"` directly (configured in the provider entry)
+4. `op` fetches the actual value from 1Password
 5. The gateway uses the resolved value in memory. It never writes it to disk.
+
+Each secret gets its own provider entry. The provider calls `op` directly with `jsonOnly: false`. No custom resolver script, no custom JSON protocol.
 
 The critical advantage over `${VAR}` environment variable interpolation: SecretRef objects are stored as structured JSON. OpenClaw's config write path treats them as opaque objects. When `openclaw doctor`, `openclaw update`, or `openclaw configure` rewrites the config file, the SecretRef objects survive intact. No more plaintext bake-back.
 
@@ -44,7 +45,7 @@ The critical advantage over `${VAR}` environment variable interpolation: SecretR
 - **OpenClaw 2026.3.2 or later.** Earlier versions have limited SecretRef credential surface. Run `openclaw --version` to check, and `npm install -g openclaw@latest` to update.
 - **1Password CLI** (`op`) installed ([install guide](https://developer.1password.com/docs/cli/get-started/))
 - **A paid 1Password account** (Teams, Business, or Enterprise). Service accounts require a paid plan.
-- **jq** installed (`brew install jq` on macOS). Used by the resolver script.
+- **jq** installed (`brew install jq` on macOS). Used by the setup script.
 
 Verify your tools:
 
@@ -119,103 +120,94 @@ op item create \
 
 ---
 
-## Step 3: Store the Service Account Token
+## Step 3: Create the Env File
 
-The resolver script needs the service account token to authenticate with 1Password. Store it in a dedicated file with locked-down permissions:
+The gateway needs 4 environment variables for 1Password to work headlessly. Store them in a single file:
 
 ```bash
-echo -n "ops_eyJ...your-token-here..." > ~/.openclaw/.op-token
-chmod 600 ~/.openclaw/.op-token
+cat > ~/.openclaw/.env << 'EOF'
+OP_SERVICE_ACCOUNT_TOKEN=ops_eyJ...your-token-here...
+OP_BIOMETRIC_UNLOCK_ENABLED=false
+OP_NO_AUTO_SIGNIN=true
+OP_LOAD_DESKTOP_APP_SETTINGS=false
+EOF
+chmod 600 ~/.openclaw/.env
 ```
 
 This file is the one secret that lives on disk. It's the bootstrap credential that unlocks everything else. Lock it down:
 
 ```bash
 # Verify permissions
-ls -la ~/.openclaw/.op-token
+ls -la ~/.openclaw/.env
 # Should show: -rw-------
 ```
 
-> **Why a file instead of an environment variable?** Environment variables in a LaunchAgent plist get clobbered when `openclaw gateway install` regenerates the plist. A file is outside OpenClaw's config management. Nothing OpenClaw does can overwrite it.
+**Why these 4 vars?**
+
+| Var | Purpose |
+|-----|---------|
+| `OP_SERVICE_ACCOUNT_TOKEN` | Auth for the service account |
+| `OP_BIOMETRIC_UNLOCK_ENABLED=false` | Prevents `op` from trying Native Messaging to the desktop app (triggers TCC) |
+| `OP_NO_AUTO_SIGNIN=true` | Suppresses interactive signin prompts |
+| `OP_LOAD_DESKTOP_APP_SETTINGS=false` | Prevents `op` from `lstat`-ing Group Containers (triggers TCC) |
+
+> **Why a file instead of environment variables in the plist?** The plist also needs these vars (see Step 6). But the file is the source of truth because it's outside OpenClaw's config management. Nothing OpenClaw does can overwrite it.
 
 ---
 
-## Step 4: Create the Resolver Script
+## Step 4: Test op read
 
-This script is the bridge between OpenClaw's SecretRef system and 1Password. It receives secret requests via JSON on stdin and resolves them using `op read`.
-
-```bash
-mkdir -p ~/.openclaw/bin
-
-cat > ~/.openclaw/bin/op-resolver.sh << 'SCRIPT'
-#!/bin/bash
-# SecretRef exec provider for OpenClaw + 1Password.
-# Reads op:// references via JSON protocol (stdin) and resolves them
-# using the 1Password CLI with a file-backed service account token.
-#
-# The service account token lives in ~/.openclaw/.op-token (chmod 600),
-# so no environment variable injection is needed from the LaunchAgent.
-
-set -euo pipefail
-
-export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$HOME/.openclaw/.op-token")"
-export OP_BIOMETRIC_UNLOCK_ENABLED=false
-
-REQUEST="$(cat)"
-IDS=($(echo "$REQUEST" | /opt/homebrew/bin/jq -r '.ids[]'))
-
-VALUES="{"
-FIRST=true
-for ID in "${IDS[@]}"; do
-  VALUE="$(/opt/homebrew/bin/op read "$ID" 2>/dev/null)"
-  VALUE="$(echo -n "$VALUE" | /opt/homebrew/bin/jq -Rs '.')"
-  if [ "$FIRST" = true ]; then
-    FIRST=false
-  else
-    VALUES="$VALUES,"
-  fi
-  VALUES="$VALUES$(echo -n "$ID" | /opt/homebrew/bin/jq -Rs '.'):$VALUE"
-done
-VALUES="$VALUES}"
-
-echo "{\"protocolVersion\":1,\"values\":$VALUES}"
-SCRIPT
-
-chmod +x ~/.openclaw/bin/op-resolver.sh
-```
-
-> **Linux users:** Replace `/opt/homebrew/bin/jq` and `/opt/homebrew/bin/op` with the paths from `which jq` and `which op` on your system.
-
-### Test the resolver
+Before touching the config, verify `op` works headlessly:
 
 ```bash
-echo '{"protocolVersion":1,"provider":"onepassword","ids":["op://OpenClaw Secrets/openclaw-discord/credential"]}' \
-  | ~/.openclaw/bin/op-resolver.sh | jq '.'
+source ~/.openclaw/.env
+op read "op://OpenClaw Secrets/openclaw-discord/credential"
 ```
 
-You should see your Discord token in the response. If it fails, verify `~/.openclaw/.op-token` contains the correct service account token and the vault/item names match.
+You should see your Discord token. If it fails, verify `~/.openclaw/.env` contains the correct service account token and the vault/item names match.
 
 ---
 
 ## Step 5: Migrate openclaw.json to SecretRef
 
-This is the core migration. You'll add the provider definition and replace each plaintext secret with a SecretRef object.
+This is the core migration. You'll add per-secret provider entries and replace each plaintext secret with a SecretRef object.
 
-### Add the secrets provider
+### Add a provider for each secret
 
-Add this block to `~/.openclaw/openclaw.json` as a top-level key:
+Add entries under `secrets.providers` in `~/.openclaw/openclaw.json`. Each provider calls `op read` for one specific secret:
 
 ```json
 {
   "secrets": {
     "providers": {
-      "onepassword": {
+      "discord-token": {
         "source": "exec",
-        "command": "/Users/YOUR_USERNAME/.openclaw/bin/op-resolver.sh",
-        "allowSymlinkCommand": false,
-        "trustedDirs": ["/Users/YOUR_USERNAME/.openclaw/bin"],
-        "passEnv": ["HOME"],
-        "jsonOnly": true,
+        "command": "/opt/homebrew/bin/op",
+        "args": ["read", "op://OpenClaw Secrets/openclaw-discord/credential", "--no-newline"],
+        "allowSymlinkCommand": true,
+        "trustedDirs": ["/opt/homebrew"],
+        "passEnv": [
+          "OP_SERVICE_ACCOUNT_TOKEN",
+          "OP_BIOMETRIC_UNLOCK_ENABLED",
+          "OP_NO_AUTO_SIGNIN",
+          "OP_LOAD_DESKTOP_APP_SETTINGS"
+        ],
+        "jsonOnly": false,
+        "timeoutMs": 15000
+      },
+      "voyage-api-key": {
+        "source": "exec",
+        "command": "/opt/homebrew/bin/op",
+        "args": ["read", "op://OpenClaw Secrets/openclaw-voyage/credential", "--no-newline"],
+        "allowSymlinkCommand": true,
+        "trustedDirs": ["/opt/homebrew"],
+        "passEnv": [
+          "OP_SERVICE_ACCOUNT_TOKEN",
+          "OP_BIOMETRIC_UNLOCK_ENABLED",
+          "OP_NO_AUTO_SIGNIN",
+          "OP_LOAD_DESKTOP_APP_SETTINGS"
+        ],
+        "jsonOnly": false,
         "timeoutMs": 15000
       }
     }
@@ -223,11 +215,13 @@ Add this block to `~/.openclaw/openclaw.json` as a top-level key:
 }
 ```
 
-> Replace `YOUR_USERNAME` with your actual username. Use absolute paths.
+Repeat for each secret. The pattern is the same every time; only the provider name and `op://` reference change.
+
+> **Linux users:** Replace `/opt/homebrew/bin/op` with the path from `which op` on your system. Set `trustedDirs` accordingly.
 
 ### Replace secrets with SecretRef objects
 
-For each secret in your config, replace the string value with a SecretRef object. The `id` field is the `op://` reference to the item in 1Password.
+For each secret in your config, replace the string value with a SecretRef object. The `provider` and `id` fields match the provider name:
 
 **Before:**
 
@@ -255,8 +249,8 @@ For each secret in your config, replace the string value with a SecretRef object
   "discord": {
     "token": {
       "source": "exec",
-      "provider": "onepassword",
-      "id": "op://OpenClaw Secrets/openclaw-discord/credential"
+      "provider": "discord-token",
+      "id": "discord-token"
     }
   }
 },
@@ -266,8 +260,8 @@ For each secret in your config, replace the string value with a SecretRef object
       "remote": {
         "apiKey": {
           "source": "exec",
-          "provider": "onepassword",
-          "id": "op://OpenClaw Secrets/openclaw-voyage/credential"
+          "provider": "voyage-api-key",
+          "id": "voyage-api-key"
         }
       }
     }
@@ -279,7 +273,7 @@ Do this for every credential field: channel tokens, API keys, search keys, TTS k
 
 ### The one exception: gateway.auth.token
 
-`gateway.auth.token` is excluded from SecretRef support (it's classified as session-bearing). For this one field, use the `${VAR}` environment variable approach:
+`gateway.auth.token` is excluded from SecretRef support (it's classified as session-bearing, blocked by #29183). For this one field, use the `${VAR}` environment variable approach:
 
 ```json
 "gateway": {
@@ -290,53 +284,64 @@ Do this for every credential field: channel tokens, API keys, search keys, TTS k
 }
 ```
 
-This is the only `${VAR}` reference remaining in your config. We handle it via the gateway launcher script in the next step.
+This is the only `${VAR}` reference remaining in your config. We handle it via plist EnvironmentVariables in the next step.
 
 ---
 
-## Step 6: Set Up the Gateway Launcher
+## Step 6: Configure the LaunchAgent
 
-The gateway needs the `OPENCLAW_GATEWAY_TOKEN` env var for the one field that can't use SecretRef. Create a launcher script that resolves it from 1Password:
+The plist needs two things: the correct node path and the right environment variables.
 
-```bash
-cat > ~/.openclaw/bin/launch-gateway.sh << 'SCRIPT'
-#!/bin/bash
-# Gateway launcher - resolves the one credential that can't use SecretRef
-# (gateway.auth.token is out-of-scope for SecretRef exec providers).
-# All other secrets are resolved by the gateway itself via SecretRef.
+### Set ProgramArguments
 
-set -euo pipefail
-
-export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$HOME/.openclaw/.op-token")"
-export OP_BIOMETRIC_UNLOCK_ENABLED=false
-export OPENCLAW_GATEWAY_TOKEN="$(/opt/homebrew/bin/op read "op://OpenClaw Secrets/openclaw-gateway/credential")"
-
-exec /opt/homebrew/Cellar/node/$(node -v | sed 's/v//')/bin/node \
-  /opt/homebrew/lib/node_modules/openclaw/dist/index.js \
-  gateway --port 18789
-SCRIPT
-
-chmod +x ~/.openclaw/bin/launch-gateway.sh
-```
-
-> **Linux users:** Replace the node path with your actual node binary path.
-
-### Configure the LaunchAgent
-
-Edit `~/Library/LaunchAgents/ai.openclaw.gateway.plist` and set `ProgramArguments` to call the launcher:
+Edit `~/Library/LaunchAgents/ai.openclaw.gateway.plist` and ensure `ProgramArguments` uses the stable node symlink (not a versioned Cellar path):
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-  <string>/Users/YOUR_USERNAME/.openclaw/bin/launch-gateway.sh</string>
+  <string>/opt/homebrew/opt/node/bin/node</string>
+  <string>/opt/homebrew/lib/node_modules/openclaw/dist/index.js</string>
+  <string>gateway</string>
+  <string>--port</string>
+  <string>18789</string>
 </array>
 ```
 
-Make sure the plist's `EnvironmentVariables` includes `HOME`:
+### Set EnvironmentVariables
+
+Add all the env vars the gateway needs:
 
 ```xml
-<key>HOME</key>
-<string>/Users/YOUR_USERNAME</string>
+<key>EnvironmentVariables</key>
+<dict>
+  <key>HOME</key>
+  <string>/Users/YOUR_USERNAME</string>
+  <key>OP_SERVICE_ACCOUNT_TOKEN</key>
+  <string>ops_eyJ...your-token...</string>
+  <key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+  <string>false</string>
+  <key>OP_NO_AUTO_SIGNIN</key>
+  <string>true</string>
+  <key>OP_LOAD_DESKTOP_APP_SETTINGS</key>
+  <string>false</string>
+  <key>OPENCLAW_GATEWAY_TOKEN</key>
+  <string>your-resolved-gateway-token</string>
+</dict>
+```
+
+To resolve the gateway token for the plist:
+```bash
+source ~/.openclaw/.env
+op read "op://OpenClaw Secrets/openclaw-gateway/credential"
+```
+
+### Set ThrottleInterval
+
+Make sure ThrottleInterval is 30 (not 1):
+
+```xml
+<key>ThrottleInterval</key>
+<integer>30</integer>
 ```
 
 ### Reload the LaunchAgent
@@ -361,17 +366,15 @@ openclaw gateway status
 When you run `openclaw` from the terminal, the CLI also needs the gateway token. The simplest approach is a shell wrapper. Add to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
-# 1Password service account for headless op commands
-export OP_SERVICE_ACCOUNT_TOKEN="ops_eyJ...your-token..."
+# 1Password env vars for OpenClaw
+source ~/.openclaw/.env
 
 # OpenClaw: resolve the one ${VAR} secret the CLI needs
 openclaw() {
-  OPENCLAW_GATEWAY_TOKEN="$(/opt/homebrew/bin/op read "op://OpenClaw Secrets/openclaw-gateway/credential")" \
+  OPENCLAW_GATEWAY_TOKEN="$(op read "op://OpenClaw Secrets/openclaw-gateway/credential")" \
     command openclaw "$@"
 }
 ```
-
-Note: unlike the old `op run --env-file` wrapper that resolved all secrets, this only resolves the one `${VAR}` reference. The gateway handles everything else via SecretRef.
 
 Reload and test:
 
@@ -382,85 +385,15 @@ openclaw status
 
 ---
 
-## Step 8: Fix the Mac App (Optional)
-
-The Mac app connects to the gateway, and the gateway resolves its own secrets. If your Mac app is working after the gateway migration, you may not need a wrapper at all.
-
-If the Mac app still needs environment variables (e.g., for local features that read the config directly), create a wrapper app:
-
-```bash
-mkdir -p "/Applications/OpenClaw (Safe).app/Contents/MacOS"
-mkdir -p "/Applications/OpenClaw (Safe).app/Contents/Resources"
-
-# Copy the icon
-cp /Applications/OpenClaw.app/Contents/Resources/OpenClaw.icns \
-   "/Applications/OpenClaw (Safe).app/Contents/Resources/AppIcon.icns"
-```
-
-Create the launcher:
-
-```bash
-cat > "/Applications/OpenClaw (Safe).app/Contents/MacOS/launch" << 'SCRIPT'
-#!/bin/bash
-export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$HOME/.openclaw/.op-token")"
-export OP_BIOMETRIC_UNLOCK_ENABLED=false
-export OPENCLAW_GATEWAY_TOKEN="$(/opt/homebrew/bin/op read "op://OpenClaw Secrets/openclaw-gateway/credential")"
-exec /Applications/OpenClaw.app/Contents/MacOS/OpenClaw
-SCRIPT
-
-chmod +x "/Applications/OpenClaw (Safe).app/Contents/MacOS/launch"
-```
-
-Create `Info.plist`:
-
-```bash
-cat > "/Applications/OpenClaw (Safe).app/Contents/Info.plist" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>launch</string>
-    <key>CFBundleIdentifier</key>
-    <string>ai.openclaw.mac.safe-launcher</string>
-    <key>CFBundleName</key>
-    <string>OpenClaw</string>
-    <key>CFBundleDisplayName</key>
-    <string>OpenClaw</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSUIElement</key>
-    <false/>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-</dict>
-</plist>
-EOF
-```
-
----
-
 ## Gotchas
 
 ### `openclaw gateway install` still clobbers the plist
 
-When OpenClaw regenerates the plist, it resets `ProgramArguments` to call node directly. You'll need to re-point it to `launch-gateway.sh`. The good news: your `openclaw.json` SecretRef objects and your `~/.openclaw/bin/` scripts are untouched. The repair is one line in the plist.
+When OpenClaw regenerates the plist, it resets everything: node path, env vars, ThrottleInterval. Run `./openclaw-1p-setup.sh repair` to fix it. Your `openclaw.json` SecretRef objects are untouched since they survive config rewrites.
 
 ### The biometric unlock prompt
 
-If you see macOS prompting *"op would like to access data from other apps"*, you're missing `OP_BIOMETRIC_UNLOCK_ENABLED=false` in a context where `op` runs headlessly. This is already handled in the resolver script and launcher, but check any other places where you invoke `op`.
-
-### Node path changes after Homebrew upgrades
-
-If you update Node.js via Homebrew, the path in `launch-gateway.sh` needs updating. You can make it dynamic:
-
-```bash
-exec "$(brew --prefix node)/bin/node" \
-  /opt/homebrew/lib/node_modules/openclaw/dist/index.js \
-  gateway --port 18789
-```
+If you see macOS prompting *"op would like to access data from other apps"*, one of the 4 TCC-prevention vars is missing. Check all three places: `~/.openclaw/.env`, the plist EnvironmentVariables, and the provider `passEnv` arrays.
 
 ### `openclaw doctor` and the gateway token
 
@@ -487,23 +420,20 @@ grep -c '"\${' ~/.openclaw/openclaw.json
 
 # 3. SecretRef objects present
 grep -c '"source" : "exec"' ~/.openclaw/openclaw.json
-# Should match the number of secrets you migrated
+# Should match the number of secrets you migrated (plus provider entries)
 
 # 4. Gateway running and reachable
 openclaw gateway status
 # Should show: RPC probe: ok
 
 # 5. Secrets audit clean
-openclaw secrets audit --check
+source ~/.openclaw/.env
+OPENCLAW_GATEWAY_TOKEN="$(op read "op://OpenClaw Secrets/openclaw-gateway/credential")" \
+  openclaw secrets audit --check
 # Should show 0 unresolved, 0 plaintext (except vibeproxy dummy key if applicable)
 
-# 6. Resolver script works
-echo '{"protocolVersion":1,"provider":"onepassword","ids":["op://OpenClaw Secrets/openclaw-discord/credential"]}' \
-  | ~/.openclaw/bin/op-resolver.sh | jq '.values | keys | length'
-# Should return 1
-
-# 7. Token file permissions locked down
-stat -f '%Sp' ~/.openclaw/.op-token
+# 6. .env file permissions locked down
+stat -f '%Sp' ~/.openclaw/.env
 # Should show: -rw-------
 ```
 
@@ -513,30 +443,13 @@ stat -f '%Sp' ~/.openclaw/.op-token
 
 This approach gives you properties that matter at organizational scale:
 
-- **Centralized credential control.** All secrets live in a 1Password vault. Onboarding a new machine means granting vault access and copying the service account token file, not distributing individual secrets.
+- **Centralized credential control.** All secrets live in a 1Password vault. Onboarding a new machine means granting vault access and copying the `.env` file, not distributing individual secrets.
 - **Instant revocation.** Disable the service account or remove vault access, and the gateway stops authenticating on next restart. No hunting through config files on individual machines.
 - **Audit trail.** 1Password logs every `op read` call. You know exactly when each credential was accessed and by which service account.
 - **Rotation without downtime.** Update a secret in 1Password, restart the gateway, done. No config file edits on any machine.
 - **Separation of duties.** The person who manages 1Password vaults doesn't need SSH access to the OpenClaw host. The person who manages OpenClaw doesn't need to know actual secret values.
-- **Config files are safe to share.** `openclaw.json` contains SecretRef objects with vault references, not secrets. You can check it into version control, share it in onboarding docs, or paste it in a support ticket.
-- **Survives updates.** SecretRef objects persist through `openclaw update`, `openclaw doctor`, and config rewrites. The only manual step after an update is re-pointing the LaunchAgent plist to the launcher script.
-
----
-
-## How This Compares to `${VAR}` + `op run`
-
-If you've seen the older pattern of using `${VAR}` environment variable references with an `op run --env-file` wrapper, here's why SecretRef is better:
-
-| | `${VAR}` + `op run` | SecretRef exec provider |
-|---|---|---|
-| **Secrets in config** | `${VAR}` strings (fragile) | Structured JSON objects (durable) |
-| **Config rewrite safety** | `openclaw doctor` can bake plaintext back | SecretRef objects survive rewrites |
-| **LaunchAgent** | Must wrap with `op run` (clobbered on update) | Launcher script resolves 1 token |
-| **Number of env vars needed** | All secrets as env vars | Just `OPENCLAW_GATEWAY_TOKEN` |
-| **Secret resolution** | At process start (all-or-nothing) | On demand (per-field, lazy) |
-| **Portability** | Requires `secrets.env` + `op run` in every context | Resolver script works everywhere |
-
-The `${VAR}` + `op run` approach still works and is simpler if you only have a few secrets. But for setups with many credentials, SecretRef is more durable and requires less maintenance after OpenClaw updates.
+- **Config files are safe to share.** `openclaw.json` contains SecretRef objects with provider references, not secrets. You can check it into version control, share it in onboarding docs, or paste it in a support ticket.
+- **Survives updates.** SecretRef objects persist through `openclaw update`, `openclaw doctor`, and config rewrites. The only manual step after an update is running the repair command to fix the plist.
 
 ---
 
@@ -546,51 +459,38 @@ After setup, these are the files this guide creates or modifies:
 
 | File | Purpose | Contains secrets? |
 |------|---------|-------------------|
-| `~/.openclaw/.op-token` | 1Password service account token | **Yes** (chmod 600) |
-| `~/.openclaw/bin/op-resolver.sh` | SecretRef exec provider script | No |
-| `~/.openclaw/bin/launch-gateway.sh` | Gateway launcher (resolves gateway token) | No |
+| `~/.openclaw/.env` | 1Password env vars (token + TCC vars) | **Yes** (chmod 600) |
 | `~/.openclaw/openclaw.json` | OpenClaw config with SecretRef objects | No |
-| `~/Library/LaunchAgents/ai.openclaw.gateway.plist` | macOS service definition | No |
-| `~/.zshrc` (modified) | Shell wrapper for CLI | Token in export (see note) |
-
-> **Note on ~/.zshrc:** The `OP_SERVICE_ACCOUNT_TOKEN` export in your shell profile is the one place the token appears in a non-600-permission file. If this concerns you, you can source it from the token file instead: `export OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.openclaw/.op-token)"`.
+| `~/Library/LaunchAgents/ai.openclaw.gateway.plist` | macOS service definition | Yes (token in EnvironmentVariables) |
+| `~/.zshrc` (modified) | Shell wrapper for CLI | No (sources .env at runtime) |
 
 ---
 
 ## Troubleshooting
 
 **Gateway won't start after migration:**
-Check `~/.openclaw/logs/gateway.err.log`. If you see "expected string, received object" for a field, that field doesn't support SecretRef. Revert it to a `${VAR}` reference and add it to your launcher script.
+Check `~/.openclaw/logs/gateway.err.log`. If you see "expected string, received object" for a field, that field doesn't support SecretRef. Revert it to a `${VAR}` reference and add the env var to the plist.
 
 **"MissingEnvVarError" for OPENCLAW_GATEWAY_TOKEN:**
-The launcher script isn't resolving the gateway token. Verify `~/.openclaw/.op-token` exists and contains the service account token, and test `op read` manually:
+The plist doesn't have the gateway token in EnvironmentVariables. Resolve it from 1Password and add it:
 
 ```bash
-OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.openclaw/.op-token)" \
-  OP_BIOMETRIC_UNLOCK_ENABLED=false \
-  /opt/homebrew/bin/op read "op://OpenClaw Secrets/openclaw-gateway/credential"
+source ~/.openclaw/.env
+op read "op://OpenClaw Secrets/openclaw-gateway/credential"
+# Copy the output and add to plist EnvironmentVariables
 ```
 
-**Resolver script fails with "No accounts configured":**
-The `~/.openclaw/.op-token` file is missing, empty, or contains an invalid token. Regenerate it from Step 3.
+**Provider fails with "No accounts configured":**
+`OP_SERVICE_ACCOUNT_TOKEN` is missing from the execution context. Check the plist EnvironmentVariables and the provider `passEnv` array.
 
 **"op would like to access data from other apps":**
-`OP_BIOMETRIC_UNLOCK_ENABLED=false` is missing in a headless context. The resolver script and launcher both set this, so check if `op` is being called from somewhere else.
+One of the 4 TCC-prevention vars is missing. Check `~/.openclaw/.env`, the plist, and the `passEnv` arrays.
 
 **Gateway shows "unreachable" but LaunchAgent says "running":**
-The process is crash-looping. Check the error log. With SecretRef, this usually means the resolver script can't reach 1Password (network issue or expired token).
+The process is crash-looping. Check the error log. This usually means `op` can't reach 1Password (network issue or expired token).
 
 **After `openclaw gateway install`, gateway breaks:**
-The plist was regenerated. Re-edit `ProgramArguments` to point to `launch-gateway.sh`:
-
-```xml
-<key>ProgramArguments</key>
-<array>
-  <string>/Users/YOUR_USERNAME/.openclaw/bin/launch-gateway.sh</string>
-</array>
-```
-
-Then reload the LaunchAgent.
+The plist was regenerated. Run `./openclaw-1p-setup.sh repair`.
 
 **`openclaw secrets audit` shows plaintext findings:**
 Check which field it flags. If it's `models.providers.vibeproxy.apiKey` with a value like `"dummy"`, that's fine (it's a local proxy with no real credential). For real secrets, migrate them to SecretRef following Step 5.

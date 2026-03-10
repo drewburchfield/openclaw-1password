@@ -12,18 +12,19 @@
 
 ## What it does
 
-Replaces plaintext secrets in `openclaw.json` with SecretRef exec provider objects that call 1Password at runtime. Secrets survive config rewrites by design, so `openclaw update` and `openclaw doctor` can't accidentally bake them back into your config file.
+Replaces plaintext secrets in `openclaw.json` with SecretRef exec provider objects that call `op` directly to read from 1Password at runtime. Each secret gets its own provider entry. No custom resolver script needed.
 
 | Before | After |
 |--------|-------|
-| `"token": "xoxb-real-token"` | `"token": { "source": "exec", "provider": "onepassword", "id": "op://..." }` |
+| `"token": "xoxb-real-token"` | `"token": { "source": "exec", "provider": "discord-token", "id": "discord-token" }` |
 | Plaintext secrets on disk | Secrets in 1Password, resolved at runtime |
 | `openclaw update` bakes secrets into JSON | SecretRef objects survive config rewrites |
 | LaunchAgent breaks after every update | One repair command fixes it |
+| Custom resolver script to maintain | Direct `op read` calls, zero custom scripts |
 
 <br>
 
-<p align="center">· · ·</p>
+<p align="center">. . .</p>
 
 ## How to use this
 
@@ -43,13 +44,13 @@ The directory structure is self-contained:
 skills/1password-openclaw/
 ├── SKILL.md                  # Main guide (start here)
 ├── references/
-│   ├── architecture.md       # SecretRef design, cross-platform notes
+│   ├── architecture.md       # Direct-op design, TCC prevention, cross-platform
 │   ├── troubleshooting.md    # Every known failure mode
 │   ├── tutorial.md           # Step-by-step manual setup
 │   └── version-adaptation.md # Handling newer OpenClaw versions
 ├── scripts/
-│   ├── openclaw-1p-setup.sh  # Setup/repair/verify/migrate automation
-│   └── op-resolver-template.sh
+│   ├── openclaw-1p-setup.sh  # Setup/repair/verify automation
+│   └── op-resolver-template.sh  # DEPRECATED (kept for reference)
 └── examples/
     └── openclaw-secretref-config.json
 ```
@@ -68,7 +69,7 @@ This registers the skill automatically. Ask Claude Code to "set up 1Password wit
 
 <br>
 
-<p align="center">· · ·</p>
+<p align="center">. . .</p>
 
 ## Setup script
 
@@ -76,10 +77,9 @@ The included shell script handles the full lifecycle:
 
 | Command | What it does |
 |---------|-------------|
-| `openclaw-1p-setup.sh setup` | Guided onboarding: vault, service account, secret migration, resolver, launcher |
+| `openclaw-1p-setup.sh setup` | Guided onboarding: vault, service account, .env file, per-secret providers, plist repair |
 | `openclaw-1p-setup.sh repair` | Fix LaunchAgent after `openclaw update` or `openclaw gateway install` |
-| `openclaw-1p-setup.sh verify` | 9-point health check across token, scripts, config, and gateway |
-| `openclaw-1p-setup.sh migrate` | Convert remaining `${VAR}` references to SecretRef objects |
+| `openclaw-1p-setup.sh verify` | Health check across token, providers, config, plist env vars, and gateway |
 
 You can run the script directly or let your AI assistant run it for you.
 
@@ -90,7 +90,7 @@ You can run the script directly or let your AI assistant run it for you.
 - [OpenClaw](https://openclaw.ai) 2026.3.2+ (works with newer versions)
 - [1Password CLI](https://developer.1password.com/docs/cli/get-started/) (`op`)
 - A paid 1Password account (service accounts require Teams, Business, or Enterprise)
-- `jq` (used by the resolver script)
+- `jq` (used by the setup script)
 
 ## License
 

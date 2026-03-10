@@ -1,12 +1,11 @@
 #!/bin/bash
 # openclaw-1p-setup.sh - Durable 1Password integration for OpenClaw
-# Sets up SecretRef exec providers so secrets never touch disk.
+# Sets up per-secret direct-op SecretRef providers so secrets never touch disk.
 #
 # Usage:
 #   ./openclaw-1p-setup.sh setup     Full onboarding (interactive)
 #   ./openclaw-1p-setup.sh repair    Fix plist after openclaw gateway install
 #   ./openclaw-1p-setup.sh verify    Check everything is working
-#   ./openclaw-1p-setup.sh migrate   Convert ${VAR} refs to SecretRef (non-destructive)
 #
 # By Drew Burchfield
 
@@ -15,11 +14,9 @@ set -euo pipefail
 # --- Configuration -----------------------------------------------------------
 
 OPENCLAW_DIR="$HOME/.openclaw"
-OPENCLAW_BIN="$OPENCLAW_DIR/bin"
 OPENCLAW_CONFIG="$OPENCLAW_DIR/openclaw.json"
-TOKEN_FILE="$OPENCLAW_DIR/.op-token"
-RESOLVER_SCRIPT="$OPENCLAW_BIN/op-resolver.sh"
-LAUNCHER_SCRIPT="$OPENCLAW_BIN/launch-gateway.sh"
+ENV_FILE="$OPENCLAW_DIR/.env"
+TOKEN_FILE="$OPENCLAW_DIR/.op-token"  # legacy, still checked for migration
 PLIST_PATH="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 SYSTEMD_UNIT="openclaw-gateway.service"
 
@@ -186,15 +183,25 @@ setup_service_account() {
 
   step "3/3" "Setting up service account"
 
-  if [ -f "$TOKEN_FILE" ]; then
+  # Check for existing token in .env or legacy .op-token
+  local existing_token=""
+  if [ -f "$ENV_FILE" ]; then
+    existing_token="$(grep '^OP_SERVICE_ACCOUNT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+  elif [ -f "$TOKEN_FILE" ]; then
+    existing_token="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$existing_token" ]; then
     # Verify existing token works
-    local test_result
-    if OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" OP_BIOMETRIC_UNLOCK_ENABLED=false \
+    if OP_SERVICE_ACCOUNT_TOKEN="$existing_token" OP_BIOMETRIC_UNLOCK_ENABLED=false \
+       OP_NO_AUTO_SIGNIN=true OP_LOAD_DESKTOP_APP_SETTINGS=false \
        "$OP_BIN" vault list --format=json 2>/dev/null | "$JQ_BIN" -e '.[0]' &>/dev/null; then
       ok "Existing service account token is valid"
+      # Ensure .env file exists with all 4 vars
+      create_env_file "$existing_token"
       return 0
     else
-      warn "Existing token at $TOKEN_FILE is invalid or expired"
+      warn "Existing token is invalid or expired"
     fi
   fi
 
@@ -216,6 +223,7 @@ setup_service_account() {
   # Verify the token works
   info "Verifying token..."
   if OP_SERVICE_ACCOUNT_TOKEN="$token" OP_BIOMETRIC_UNLOCK_ENABLED=false \
+     OP_NO_AUTO_SIGNIN=true OP_LOAD_DESKTOP_APP_SETTINGS=false \
      "$OP_BIN" vault list --format=json 2>/dev/null | "$JQ_BIN" -e '.[0]' &>/dev/null; then
     ok "Token is valid"
   else
@@ -223,11 +231,36 @@ setup_service_account() {
     exit 1
   fi
 
-  # Store token
+  # Create .env file
+  create_env_file "$token"
+}
+
+create_env_file() {
+  local token="$1"
+
   mkdir -p "$OPENCLAW_DIR"
-  echo -n "$token" > "$TOKEN_FILE"
-  chmod 600 "$TOKEN_FILE"
-  ok "Token stored at $TOKEN_FILE (chmod 600)"
+  cat > "$ENV_FILE" << EOF
+OP_SERVICE_ACCOUNT_TOKEN=$token
+OP_BIOMETRIC_UNLOCK_ENABLED=false
+OP_NO_AUTO_SIGNIN=true
+OP_LOAD_DESKTOP_APP_SETTINGS=false
+EOF
+  chmod 600 "$ENV_FILE"
+  ok "Env file created at $ENV_FILE (chmod 600)"
+}
+
+# Load env vars from .env file into current shell
+load_env() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+  elif [ -f "$TOKEN_FILE" ]; then
+    export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")"
+    export OP_BIOMETRIC_UNLOCK_ENABLED=false
+    export OP_NO_AUTO_SIGNIN=true
+    export OP_LOAD_DESKTOP_APP_SETTINGS=false
+  fi
 }
 
 # --- Secret Discovery --------------------------------------------------------
@@ -287,19 +320,17 @@ migrate_secret_to_1password() {
   local vault_name="$1"
   local item_name="$2"
   local secret_value="$3"
-  local token
-  token="$(cat "$TOKEN_FILE")"
+
+  load_env
 
   # Check if item already exists
-  if OP_SERVICE_ACCOUNT_TOKEN="$token" OP_BIOMETRIC_UNLOCK_ENABLED=false \
-     "$OP_BIN" item get "$item_name" --vault "$vault_name" &>/dev/null; then
+  if "$OP_BIN" item get "$item_name" --vault "$vault_name" &>/dev/null; then
     ok "Item '$item_name' already exists in vault"
     return 0
   fi
 
   # Create item
-  OP_SERVICE_ACCOUNT_TOKEN="$token" OP_BIOMETRIC_UNLOCK_ENABLED=false \
-    "$OP_BIN" item create \
+  "$OP_BIN" item create \
     --category "API Credential" \
     --title "$item_name" \
     --vault "$vault_name" \
@@ -318,110 +349,86 @@ resolve_envvar_value() {
   fi
   # Try to resolve via op run if secrets.env exists
   if [ -f "$OPENCLAW_DIR/secrets.env" ]; then
-    local token
-    token="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
-    if [ -n "$token" ]; then
-      val="$(OP_SERVICE_ACCOUNT_TOKEN="$token" OP_BIOMETRIC_UNLOCK_ENABLED=false \
-        "$OP_BIN" run --env-file="$OPENCLAW_DIR/secrets.env" -- printenv "$varname" 2>/dev/null || true)"
-      if [ -n "$val" ]; then
-        echo "$val"
-        return 0
-      fi
+    load_env
+    val="$("$OP_BIN" run --env-file="$OPENCLAW_DIR/secrets.env" -- printenv "$varname" 2>/dev/null || true)"
+    if [ -n "$val" ]; then
+      echo "$val"
+      return 0
     fi
   fi
   return 1
 }
 
-# --- File Generation ----------------------------------------------------------
-
-generate_resolver_script() {
-  mkdir -p "$OPENCLAW_BIN"
-  cat > "$RESOLVER_SCRIPT" << SCRIPT
-#!/bin/bash
-# SecretRef exec provider for OpenClaw + 1Password.
-# Reads op:// references via JSON protocol (stdin) and resolves them
-# using the 1Password CLI with a file-backed service account token.
-#
-# Generated by openclaw-1p-setup.sh
-
-set -euo pipefail
-
-export OP_SERVICE_ACCOUNT_TOKEN="\$(cat "\$HOME/.openclaw/.op-token")"
-export OP_BIOMETRIC_UNLOCK_ENABLED=false
-
-REQUEST="\$(cat)"
-IDS=(\$(echo "\$REQUEST" | $JQ_BIN -r '.ids[]'))
-
-VALUES="{"
-FIRST=true
-for ID in "\${IDS[@]}"; do
-  VALUE="\$($OP_BIN read "\$ID" 2>/dev/null)"
-  VALUE="\$(echo -n "\$VALUE" | $JQ_BIN -Rs '.')"
-  if [ "\$FIRST" = true ]; then
-    FIRST=false
-  else
-    VALUES="\$VALUES,"
-  fi
-  VALUES="\$VALUES\$(echo -n "\$ID" | $JQ_BIN -Rs '.'):\$VALUE"
-done
-VALUES="\$VALUES}"
-
-echo "{\"protocolVersion\":1,\"values\":\$VALUES}"
-SCRIPT
-  chmod +x "$RESOLVER_SCRIPT"
-  ok "Resolver script created at $RESOLVER_SCRIPT"
-}
-
-generate_launcher_script() {
-  local gateway_op_ref="$1"
-  local node_bin
-  node_bin="$(find_binary node)"
-
-  mkdir -p "$OPENCLAW_BIN"
-  cat > "$LAUNCHER_SCRIPT" << SCRIPT
-#!/bin/bash
-# Gateway launcher - resolves the one credential that can't use SecretRef
-# (gateway.auth.token is out-of-scope for SecretRef exec providers).
-# All other secrets are resolved by the gateway itself via SecretRef.
-#
-# Generated by openclaw-1p-setup.sh
-
-set -euo pipefail
-
-export OP_SERVICE_ACCOUNT_TOKEN="\$(cat "\$HOME/.openclaw/.op-token")"
-export OP_BIOMETRIC_UNLOCK_ENABLED=false
-export OPENCLAW_GATEWAY_TOKEN="\$($OP_BIN read "$gateway_op_ref")"
-
-exec $node_bin \\
-  \$(dirname \$(readlink -f "\$(which openclaw)" 2>/dev/null || echo "$node_bin"))/../../lib/node_modules/openclaw/dist/index.js \\
-  gateway --port \${OPENCLAW_GATEWAY_PORT:-18789}
-SCRIPT
-  chmod +x "$LAUNCHER_SCRIPT"
-  ok "Launcher script created at $LAUNCHER_SCRIPT"
-}
-
 # --- Config Migration ---------------------------------------------------------
 
-# Build the SecretRef object for a given op:// path
+# Build the provider JSON for a given op:// path and provider name
+provider_json() {
+  local provider_name="$1"
+  local op_ref="$2"
+
+  "$JQ_BIN" -n \
+    --arg cmd "$OP_BIN" \
+    --arg ref "$op_ref" \
+    '{
+      source: "exec",
+      command: $cmd,
+      args: ["read", $ref, "--no-newline"],
+      allowSymlinkCommand: true,
+      trustedDirs: ["/opt/homebrew"],
+      passEnv: [
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "OP_BIOMETRIC_UNLOCK_ENABLED",
+        "OP_NO_AUTO_SIGNIN",
+        "OP_LOAD_DESKTOP_APP_SETTINGS"
+      ],
+      jsonOnly: false,
+      timeoutMs: 15000
+    }'
+}
+
+# Build the SecretRef object for a given provider name
 secretref_json() {
-  local op_ref="$1"
-  "$JQ_BIN" -n --arg ref "$op_ref" '{
+  local provider_name="$1"
+  "$JQ_BIN" -n --arg prov "$provider_name" '{
     source: "exec",
-    provider: "onepassword",
-    id: $ref
+    provider: $prov,
+    id: $prov
   }'
+}
+
+add_provider_to_config() {
+  local config="$1"
+  local provider_name="$2"
+  local op_ref="$3"
+
+  # Check if this provider already exists
+  if "$JQ_BIN" -e ".secrets.providers[\"$provider_name\"]" "$config" &>/dev/null; then
+    ok "Provider '$provider_name' already configured"
+    return 0
+  fi
+
+  local prov
+  prov="$(provider_json "$provider_name" "$op_ref")"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # Ensure secrets.providers exists, then add the provider
+  "$JQ_BIN" --arg name "$provider_name" --argjson prov "$prov" '
+    .secrets.providers[$name] = $prov
+  ' "$config" > "$tmp"
+  mv "$tmp" "$config"
 }
 
 apply_secretref_to_config() {
   local config="$1"
   local json_path="$2"
-  local op_ref="$3"
+  local provider_name="$3"
 
   local ref_obj
-  ref_obj="$(secretref_json "$op_ref")"
+  ref_obj="$(secretref_json "$provider_name")"
 
   # Use jq to set the value at the given path
-  # jq path format: .channels.discord.token
   local jq_path=".${json_path}"
   local tmp
   tmp="$(mktemp)"
@@ -442,40 +449,29 @@ apply_envvar_to_config() {
   mv "$tmp" "$config"
 }
 
-add_secrets_provider() {
+ensure_secrets_providers_block() {
   local config="$1"
 
-  # Check if already present
-  if "$JQ_BIN" -e '.secrets.providers.onepassword' "$config" &>/dev/null; then
-    ok "SecretRef provider 'onepassword' already configured"
-    return 0
+  if ! "$JQ_BIN" -e '.secrets.providers' "$config" &>/dev/null; then
+    local tmp
+    tmp="$(mktemp)"
+    "$JQ_BIN" '. + {secrets: {providers: {}}}' "$config" > "$tmp"
+    mv "$tmp" "$config"
+    ok "Created secrets.providers block in config"
   fi
+}
 
-  local provider
-  provider="$("$JQ_BIN" -n \
-    --arg cmd "$RESOLVER_SCRIPT" \
-    --arg dir "$OPENCLAW_BIN" \
-    '{
-      secrets: {
-        providers: {
-          onepassword: {
-            source: "exec",
-            command: $cmd,
-            allowSymlinkCommand: false,
-            trustedDirs: [$dir],
-            passEnv: ["HOME"],
-            jsonOnly: true,
-            timeoutMs: 15000
-          }
-        }
-      }
-    }')"
+# Remove old resolver-based provider if it exists
+remove_legacy_provider() {
+  local config="$1"
 
-  local tmp
-  tmp="$(mktemp)"
-  "$JQ_BIN" --argjson provider "$provider" '. + $provider' "$config" > "$tmp"
-  mv "$tmp" "$config"
-  ok "SecretRef provider 'onepassword' added to config"
+  if "$JQ_BIN" -e '.secrets.providers.onepassword' "$config" &>/dev/null; then
+    local tmp
+    tmp="$(mktemp)"
+    "$JQ_BIN" 'del(.secrets.providers.onepassword)' "$config" > "$tmp"
+    mv "$tmp" "$config"
+    ok "Removed legacy 'onepassword' resolver-based provider"
+  fi
 }
 
 # --- LaunchAgent / systemd ----------------------------------------------------
@@ -486,18 +482,128 @@ repair_launchagent() {
     return 1
   fi
 
-  info "Updating LaunchAgent ProgramArguments..."
+  local node_bin="/opt/homebrew/opt/node/bin/node"
+  local changes=0
 
-  # Replace ProgramArguments with launcher script
-  /usr/libexec/PlistBuddy -c "Delete :ProgramArguments" "$PLIST_PATH" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "$PLIST_PATH"
-  /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string $LAUNCHER_SCRIPT" "$PLIST_PATH"
+  # Fix node path: replace versioned Cellar path with stable symlink
+  if grep -q '/opt/homebrew/Cellar/node/' "$PLIST_PATH"; then
+    sed -i '' "s|/opt/homebrew/Cellar/node/[^<]*/bin/node|$node_bin|g" "$PLIST_PATH"
+    ok "Fixed node path -> $node_bin"
+    changes=$((changes + 1))
+  else
+    ok "Node path already stable"
+  fi
+
+  # Fix ThrottleInterval using PlistBuddy
+  local current_throttle
+  current_throttle="$(/usr/libexec/PlistBuddy -c "Print :ThrottleInterval" "$PLIST_PATH" 2>/dev/null || echo "0")"
+  if [ "$current_throttle" -lt 30 ] 2>/dev/null; then
+    /usr/libexec/PlistBuddy -c "Set :ThrottleInterval 30" "$PLIST_PATH" 2>/dev/null || \
+      /usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 30" "$PLIST_PATH" 2>/dev/null || true
+    ok "Fixed ThrottleInterval -> 30"
+    changes=$((changes + 1))
+  else
+    ok "ThrottleInterval already >= 30"
+  fi
+
+  # Load env vars
+  load_env
+
+  # Ensure OP_SERVICE_ACCOUNT_TOKEN in plist
+  local current_val
+  current_val="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:OP_SERVICE_ACCOUNT_TOKEN" "$PLIST_PATH" 2>/dev/null || echo "")"
+  if [ -z "$current_val" ]; then
+    local token="${OP_SERVICE_ACCOUNT_TOKEN:-}"
+    if [ -n "$token" ]; then
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:OP_SERVICE_ACCOUNT_TOKEN string $token" "$PLIST_PATH" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:OP_SERVICE_ACCOUNT_TOKEN $token" "$PLIST_PATH" 2>/dev/null || true
+      ok "Added OP_SERVICE_ACCOUNT_TOKEN to plist"
+      changes=$((changes + 1))
+    else
+      warn "Could not find OP_SERVICE_ACCOUNT_TOKEN. Add it to plist manually."
+    fi
+  else
+    ok "OP_SERVICE_ACCOUNT_TOKEN present in plist"
+  fi
+
+  # Ensure OP_BIOMETRIC_UNLOCK_ENABLED=false in plist
+  ensure_plist_env_var "OP_BIOMETRIC_UNLOCK_ENABLED" "false"
+  changes=$((changes + $?))
+
+  # Ensure OP_NO_AUTO_SIGNIN=true in plist
+  ensure_plist_env_var "OP_NO_AUTO_SIGNIN" "true"
+  changes=$((changes + $?))
+
+  # Ensure OP_LOAD_DESKTOP_APP_SETTINGS=false in plist
+  ensure_plist_env_var "OP_LOAD_DESKTOP_APP_SETTINGS" "false"
+  changes=$((changes + $?))
+
+  # Resolve and ensure OPENCLAW_GATEWAY_TOKEN in plist
+  if ! /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:OPENCLAW_GATEWAY_TOKEN" "$PLIST_PATH" &>/dev/null; then
+    local gateway_token=""
+    gateway_token="$(resolve_gateway_token)"
+    if [ -n "$gateway_token" ]; then
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:OPENCLAW_GATEWAY_TOKEN string $gateway_token" "$PLIST_PATH" 2>/dev/null || true
+      ok "Added OPENCLAW_GATEWAY_TOKEN to plist"
+      changes=$((changes + 1))
+    else
+      warn "Could not resolve gateway token. Add OPENCLAW_GATEWAY_TOKEN to plist manually."
+    fi
+  else
+    ok "OPENCLAW_GATEWAY_TOKEN present in plist"
+  fi
 
   # Ensure HOME is set
   /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:HOME $HOME" "$PLIST_PATH" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:HOME string $HOME" "$PLIST_PATH" 2>/dev/null || true
 
-  ok "LaunchAgent plist updated"
+  if [ "$changes" -gt 0 ]; then
+    ok "LaunchAgent plist updated ($changes fix(es) applied)"
+  else
+    ok "LaunchAgent plist already correct"
+  fi
+}
+
+# Helper: ensure a specific env var exists in plist with correct value
+ensure_plist_env_var() {
+  local varname="$1"
+  local expected="$2"
+
+  local current
+  current="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$varname" "$PLIST_PATH" 2>/dev/null || echo "")"
+  if [ "$current" != "$expected" ]; then
+    if [ -n "$current" ]; then
+      /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:$varname $expected" "$PLIST_PATH" 2>/dev/null || true
+    else
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:$varname string $expected" "$PLIST_PATH" 2>/dev/null || true
+    fi
+    ok "$varname set to $expected in plist"
+    return 1  # 1 change made
+  else
+    ok "$varname already correct in plist"
+    return 0
+  fi
+}
+
+# Resolve gateway token from 1Password
+resolve_gateway_token() {
+  load_env
+
+  # Try to find the op:// reference from config (check common provider names)
+  local vault_name=""
+  for name in "op-gateway" "gateway-token"; do
+    vault_name="$("$JQ_BIN" -r ".secrets.providers[\"$name\"].args[] | select(startswith(\"op://\"))" "$OPENCLAW_CONFIG" 2>/dev/null || true)"
+    [ -n "$vault_name" ] && break
+  done
+
+  if [ -z "$vault_name" ]; then
+    # Fall back to default reference
+    vault_name="op://OpenClaw Secrets/openclaw-gateway/credential"
+  fi
+
+  local token
+  token="$("$OP_BIN" read "$vault_name" 2>/dev/null || true)"
+  echo "$token"
 }
 
 bounce_gateway_macos() {
@@ -529,61 +635,50 @@ verify() {
 
   step "V" "Running verification"
 
-  # 1. Token file
-  if [ -f "$TOKEN_FILE" ]; then
+  # 1. Env file
+  if [ -f "$ENV_FILE" ]; then
     local perms
     if [ "$PLATFORM" = "macos" ]; then
-      perms="$(stat -f '%Sp' "$TOKEN_FILE")"
+      perms="$(stat -f '%Sp' "$ENV_FILE")"
     else
-      perms="$(stat -c '%a' "$TOKEN_FILE")"
+      perms="$(stat -c '%a' "$ENV_FILE")"
     fi
     if [[ "$perms" == "-rw-------" ]] || [[ "$perms" == "600" ]]; then
-      ok "Token file exists with correct permissions"
+      ok "Env file exists with correct permissions"
     else
-      warn "Token file permissions are $perms (should be 600)"
+      warn "Env file permissions are $perms (should be 600)"
       failures=$((failures + 1))
     fi
   else
-    err "Token file missing at $TOKEN_FILE"
+    err "Env file missing at $ENV_FILE"
     failures=$((failures + 1))
   fi
 
   # 2. Token is valid
-  if [ -f "$TOKEN_FILE" ]; then
-    if OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" OP_BIOMETRIC_UNLOCK_ENABLED=false \
-       "$OP_BIN" vault list --format=json 2>/dev/null | "$JQ_BIN" -e '.[0]' &>/dev/null; then
+  load_env
+  if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+    if "$OP_BIN" vault list --format=json 2>/dev/null | "$JQ_BIN" -e '.[0]' &>/dev/null; then
       ok "Service account token is valid"
     else
       err "Service account token is invalid or expired"
       failures=$((failures + 1))
     fi
-  fi
-
-  # 3. Resolver script
-  if [ -x "$RESOLVER_SCRIPT" ]; then
-    ok "Resolver script exists and is executable"
   else
-    err "Resolver script missing or not executable at $RESOLVER_SCRIPT"
+    err "OP_SERVICE_ACCOUNT_TOKEN not found in env"
     failures=$((failures + 1))
   fi
 
-  # 4. Launcher script
-  if [ -x "$LAUNCHER_SCRIPT" ]; then
-    ok "Launcher script exists and is executable"
+  # 3. SecretRef providers in config
+  local provider_count
+  provider_count="$("$JQ_BIN" -r '.secrets.providers | keys | length' "$OPENCLAW_CONFIG" 2>/dev/null || echo "0")"
+  if [ "$provider_count" -gt 0 ]; then
+    ok "$provider_count SecretRef provider(s) configured"
   else
-    err "Launcher script missing or not executable at $LAUNCHER_SCRIPT"
+    err "No SecretRef providers found in config"
     failures=$((failures + 1))
   fi
 
-  # 5. SecretRef provider in config
-  if "$JQ_BIN" -e '.secrets.providers.onepassword' "$OPENCLAW_CONFIG" &>/dev/null; then
-    ok "SecretRef provider 'onepassword' configured"
-  else
-    err "SecretRef provider 'onepassword' not found in config"
-    failures=$((failures + 1))
-  fi
-
-  # 6. No plaintext secrets (check for common patterns)
+  # 4. No plaintext secrets (check for common patterns)
   local plaintext_count
   plaintext_count="$(grep -cE '"(sk-|xox|ghp_|pa-|ops_)[a-zA-Z0-9]' "$OPENCLAW_CONFIG" 2>/dev/null || echo "0")"
   plaintext_count="$(echo "$plaintext_count" | tr -d '[:space:]')"
@@ -594,7 +689,7 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  # 7. Count remaining ${VAR} references (1 is expected for gateway.auth.token)
+  # 5. Count remaining ${VAR} references (1 is expected for gateway.auth.token)
   local envvar_count
   envvar_count="$(grep -cE '"\$\{[A-Z_]+\}"' "$OPENCLAW_CONFIG" 2>/dev/null || echo 0)"
   if [ "$envvar_count" -le 1 ]; then
@@ -604,7 +699,22 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  # 8. Gateway running
+  # 6. 1Password env vars in plist (macOS only)
+  if [ "$PLATFORM" = "macos" ] && [ -f "$PLIST_PATH" ]; then
+    local plist_ok=true
+    for varname in OP_SERVICE_ACCOUNT_TOKEN OP_BIOMETRIC_UNLOCK_ENABLED OP_NO_AUTO_SIGNIN OP_LOAD_DESKTOP_APP_SETTINGS OPENCLAW_GATEWAY_TOKEN; do
+      if ! /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$varname" "$PLIST_PATH" &>/dev/null; then
+        warn "$varname missing from plist EnvironmentVariables"
+        plist_ok=false
+        failures=$((failures + 1))
+      fi
+    done
+    if $plist_ok; then
+      ok "All required env vars present in plist"
+    fi
+  fi
+
+  # 7. Gateway running
   if lsof -i :${OPENCLAW_GATEWAY_PORT:-18789} &>/dev/null; then
     ok "Gateway is listening on port ${OPENCLAW_GATEWAY_PORT:-18789}"
   else
@@ -612,21 +722,12 @@ verify() {
     failures=$((failures + 1))
   fi
 
-  # 9. Secrets audit (needs OPENCLAW_GATEWAY_TOKEN resolved for the one ${VAR} field)
-  if command -v openclaw &>/dev/null && [ -f "$TOKEN_FILE" ] && [ -x "$LAUNCHER_SCRIPT" ]; then
-    # Extract the op:// ref from the launcher script
-    local gw_ref
-    gw_ref="$(grep -oE 'op://[^ "]+' "$LAUNCHER_SCRIPT" 2>/dev/null | head -1)"
-    local gateway_token=""
-    if [ -n "$gw_ref" ]; then
-      gateway_token="$(OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" \
-        OP_BIOMETRIC_UNLOCK_ENABLED=false \
-        "$OP_BIN" read "$gw_ref" 2>/dev/null || true)"
-    fi
+  # 8. Secrets audit
+  if command -v openclaw &>/dev/null; then
+    local gateway_token
+    gateway_token="$(resolve_gateway_token)"
     local audit_result
     audit_result="$(OPENCLAW_GATEWAY_TOKEN="${gateway_token}" \
-      OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TOKEN_FILE")" \
-      OP_BIOMETRIC_UNLOCK_ENABLED=false \
       openclaw secrets audit --check 2>&1 || true)"
     local unresolved
     unresolved="$(echo "$audit_result" | sed -n 's/.*unresolved=\([0-9]*\).*/\1/p' | head -1)"
@@ -653,7 +754,7 @@ verify() {
 
 cmd_setup() {
   echo -e "${BOLD}OpenClaw + 1Password Setup${RESET}"
-  echo -e "${DIM}SecretRef exec provider with file-backed service account${RESET}"
+  echo -e "${DIM}Direct-op SecretRef providers with TCC prevention${RESET}"
   echo
 
   check_prerequisites
@@ -669,7 +770,6 @@ cmd_setup() {
   step "4" "Discovering secrets in openclaw.json"
 
   local secrets_found=()
-  local secret_paths=()
   local secret_types=()
 
   while IFS=$'\t' read -r path type_or_var extra; do
@@ -708,7 +808,7 @@ cmd_setup() {
   # --- Naming convention ---
   step "5" "Migrating secrets to 1Password"
 
-  # Map config paths to 1Password item names
+  # Map config paths to 1Password item names and provider names
   declare -A PATH_TO_ITEM_NAME=(
     ["channels.discord.token"]="openclaw-discord"
     ["channels.bluebubbles.password"]="openclaw-bluebubbles"
@@ -721,7 +821,23 @@ cmd_setup() {
     ["tools.web.search.apiKey"]="openclaw-brave-search"
   )
 
-  local gateway_op_ref=""
+  declare -A PATH_TO_PROVIDER_NAME=(
+    ["channels.discord.token"]="discord-token"
+    ["channels.bluebubbles.password"]="bluebubbles-password"
+    ["channels.telegram.token"]="telegram-token"
+    ["channels.slack.botToken"]="slack-token"
+    ["gateway.auth.token"]="gateway-token"
+    ["agents.defaults.memorySearch.remote.apiKey"]="voyage-api-key"
+    ["messages.tts.openai.apiKey"]="openai-tts-key"
+    ["talk.apiKey"]="elevenlabs-key"
+    ["tools.web.search.apiKey"]="brave-search-key"
+  )
+
+  load_env
+
+  # Ensure secrets.providers block exists and remove legacy provider
+  ensure_secrets_providers_block "$OPENCLAW_CONFIG"
+  remove_legacy_provider "$OPENCLAW_CONFIG"
 
   for i in "${!secrets_found[@]}"; do
     local path="${secrets_found[$i]}"
@@ -737,6 +853,13 @@ cmd_setup() {
       local leaf
       leaf="$(echo "$path" | sed 's/.*entries\.\([^.]*\)\..*/openclaw-\1/')"
       item_name="$(ask "1Password item name for $path" "$leaf")"
+    fi
+
+    # Determine provider name
+    local provider_name="${PATH_TO_PROVIDER_NAME[$path]:-}"
+    if [ -z "$provider_name" ]; then
+      # Derive from item name
+      provider_name="$(echo "$item_name" | sed 's/^openclaw-//')-key"
     fi
 
     local op_ref="op://$vault_name/$item_name/credential"
@@ -761,23 +884,21 @@ cmd_setup() {
     # Apply config change
     if [ "$path" = "gateway.auth.token" ]; then
       # gateway.auth.token can't use SecretRef, use ${VAR}
+      # But still add a provider so repair can resolve the token
+      add_provider_to_config "$OPENCLAW_CONFIG" "$provider_name" "$op_ref"
       apply_envvar_to_config "$OPENCLAW_CONFIG" "$path" "OPENCLAW_GATEWAY_TOKEN"
-      gateway_op_ref="$op_ref"
-      ok "$path -> \${OPENCLAW_GATEWAY_TOKEN} (SecretRef not supported for this field)"
+      ok "$path -> \${OPENCLAW_GATEWAY_TOKEN} (SecretRef blocked by #29183)"
     else
-      apply_secretref_to_config "$OPENCLAW_CONFIG" "$path" "$op_ref"
-      ok "$path -> SecretRef ($op_ref)"
+      add_provider_to_config "$OPENCLAW_CONFIG" "$provider_name" "$op_ref"
+      apply_secretref_to_config "$OPENCLAW_CONFIG" "$path" "$provider_name"
+      ok "$path -> SecretRef (provider: $provider_name)"
     fi
   done
 
-  # Add the provider block
-  step "6" "Configuring SecretRef provider"
-  generate_resolver_script
-  add_secrets_provider "$OPENCLAW_CONFIG"
-
-  # Test the resolver
-  info "Testing resolver..."
-  local test_ref
+  # Test op read
+  step "6" "Testing 1Password access"
+  info "Testing op read..."
+  local test_ref=""
   for i in "${!secrets_found[@]}"; do
     local path="${secrets_found[$i]}"
     [ "$path" = "gateway.auth.token" ] && continue
@@ -791,30 +912,23 @@ cmd_setup() {
 
   if [ -n "${test_ref:-}" ]; then
     local test_result
-    test_result="$(echo "{\"protocolVersion\":1,\"provider\":\"onepassword\",\"ids\":[\"$test_ref\"]}" \
-      | "$RESOLVER_SCRIPT" 2>/dev/null | "$JQ_BIN" -r '.values | keys | length' 2>/dev/null || echo "0")"
-    if [ "$test_result" -gt 0 ]; then
-      ok "Resolver successfully resolved a test secret"
+    test_result="$("$OP_BIN" read "$test_ref" 2>/dev/null | head -c 10 || echo "")"
+    if [ -n "$test_result" ]; then
+      ok "op read successfully resolved a test secret"
     else
-      err "Resolver test failed. Check $TOKEN_FILE and vault access."
+      err "op read test failed. Check $ENV_FILE and vault access."
     fi
   fi
 
-  # Generate launcher and fix service
-  step "7" "Setting up gateway launcher"
-
-  if [ -z "$gateway_op_ref" ]; then
-    gateway_op_ref="op://$vault_name/openclaw-gateway/credential"
-  fi
-
-  generate_launcher_script "$gateway_op_ref"
+  # Fix service
+  step "7" "Configuring gateway service"
 
   if [ "$PLATFORM" = "macos" ] && [ -f "$PLIST_PATH" ]; then
     repair_launchagent
     bounce_gateway
   elif [ "$PLATFORM" = "linux" ]; then
-    warn "Linux detected. You may need to update your systemd unit manually."
-    dim "Set ExecStart=$LAUNCHER_SCRIPT in your service file."
+    warn "Linux detected. Add 1Password env vars and OPENCLAW_GATEWAY_TOKEN to your systemd unit."
+    dim "Set Environment= directives in your service file."
   fi
 
   # Shell wrapper advice
@@ -822,12 +936,12 @@ cmd_setup() {
   echo
   info "Add this to your ~/.zshrc (or ~/.bashrc):"
   echo
-  echo -e "${DIM}  # 1Password service account for OpenClaw"
-  echo "  export OP_SERVICE_ACCOUNT_TOKEN=\"\$(cat ~/.openclaw/.op-token)\""
+  echo -e "${DIM}  # 1Password env vars for OpenClaw"
+  echo "  source ~/.openclaw/.env"
   echo ""
   echo "  # Resolve gateway token for CLI"
   echo "  openclaw() {"
-  echo "    OPENCLAW_GATEWAY_TOKEN=\"\$($OP_BIN read \"$gateway_op_ref\")\" \\"
+  echo "    OPENCLAW_GATEWAY_TOKEN=\"\$($OP_BIN read \"op://$vault_name/openclaw-gateway/credential\")\" \\"
   echo "      command openclaw \"\$@\""
   echo "  }"
   echo -e "${RESET}"
@@ -848,30 +962,31 @@ cmd_repair() {
   OP_BIN="$(find_binary op)" || { err "op not found"; exit 1; }
   JQ_BIN="$(find_binary jq)" || { err "jq not found"; exit 1; }
 
-  # Verify scripts exist
-  if [ ! -x "$RESOLVER_SCRIPT" ]; then
-    err "Resolver script not found. Run '$0 setup' first."
-    exit 1
-  fi
-  if [ ! -x "$LAUNCHER_SCRIPT" ]; then
-    err "Launcher script not found. Run '$0 setup' first."
-    exit 1
+  # Ensure .env file exists (migrate from legacy .op-token if needed)
+  if [ ! -f "$ENV_FILE" ] && [ -f "$TOKEN_FILE" ]; then
+    info "Migrating from legacy .op-token to .env..."
+    local token
+    token="$(cat "$TOKEN_FILE")"
+    create_env_file "$token"
   fi
 
-  # Check if SecretRef provider is still in config
-  if ! "$JQ_BIN" -e '.secrets.providers.onepassword' "$OPENCLAW_CONFIG" &>/dev/null; then
-    warn "SecretRef provider was removed from config. Re-adding..."
-    add_secrets_provider "$OPENCLAW_CONFIG"
+  load_env
+
+  # Check if SecretRef providers are still in config
+  local provider_count
+  provider_count="$("$JQ_BIN" -r '.secrets.providers | keys | length' "$OPENCLAW_CONFIG" 2>/dev/null || echo "0")"
+  if [ "$provider_count" -gt 0 ]; then
+    ok "SecretRef providers intact ($provider_count provider(s))"
   else
-    ok "SecretRef provider intact"
+    warn "SecretRef providers were removed from config. Re-run '$0 setup' to restore them."
   fi
 
-  # Fix plist
+  # Fix plist (node path, throttle interval, env vars, gateway token)
   if [ "$PLATFORM" = "macos" ] && [ -f "$PLIST_PATH" ]; then
     repair_launchagent
     bounce_gateway
   elif [ "$PLATFORM" = "linux" ]; then
-    info "Linux: verify your systemd unit uses ExecStart=$LAUNCHER_SCRIPT"
+    info "Linux: verify your systemd unit has 1Password env vars and OPENCLAW_GATEWAY_TOKEN."
   fi
 
   verify || true
@@ -886,54 +1001,12 @@ cmd_verify() {
   verify
 }
 
-cmd_migrate() {
-  echo -e "${BOLD}OpenClaw Config Migration${RESET}"
-  echo -e "${DIM}Convert \${VAR} references to SecretRef objects${RESET}"
-  echo
-
-  OP_BIN="$(find_binary op)" || { err "op not found"; exit 1; }
-  JQ_BIN="$(find_binary jq)" || { err "jq not found"; exit 1; }
-
-  # This reuses the setup flow but only for the config migration part
-  if [ ! -f "$TOKEN_FILE" ]; then
-    err "No token file found. Run '$0 setup' first."
-    exit 1
-  fi
-
-  local vault_name
-  vault_name="$(ask "1Password vault name" "OpenClaw Secrets")"
-
-  step "1" "Discovering secrets"
-  local has_envvars=false
-  while IFS=$'\t' read -r path type_or_var extra; do
-    [ -z "$path" ] && continue
-    if [ "$extra" = "envvar" ]; then
-      has_envvars=true
-      info "  $path -> \${$type_or_var} (will convert to SecretRef)"
-    fi
-  done < <(discover_secrets "$OPENCLAW_CONFIG")
-
-  if ! $has_envvars; then
-    ok "No \${VAR} references to migrate. Config is already using SecretRef."
-    return 0
-  fi
-
-  if ! ask_yn "Proceed?"; then
-    info "Aborted."
-    exit 0
-  fi
-
-  # Reuse the full setup logic with existing vault
-  cmd_setup
-}
-
 # --- Entry Point --------------------------------------------------------------
 
 case "${1:-help}" in
   setup)   cmd_setup ;;
   repair)  cmd_repair ;;
   verify)  cmd_verify ;;
-  migrate) cmd_migrate ;;
   help|--help|-h)
     echo "Usage: $0 <command>"
     echo
@@ -941,7 +1014,6 @@ case "${1:-help}" in
     echo "  setup     Full onboarding (interactive)"
     echo "  repair    Fix plist/service after openclaw gateway install"
     echo "  verify    Check everything is working"
-    echo "  migrate   Convert \${VAR} refs to SecretRef"
     echo
     echo "After OpenClaw updates, run: $0 repair"
     ;;
